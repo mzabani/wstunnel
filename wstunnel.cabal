@@ -29,6 +29,7 @@ library
                      , tls
                      , data-default-class
                      , x509-store
+                     , x509-system
                      , monad-control
                      , transformers-base
   default-language:    Haskell2010
