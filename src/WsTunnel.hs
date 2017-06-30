@@ -15,6 +15,7 @@ module WsTunnel  (
   , TunnelConnection
   , TunnelException
   , TunnelT
+  , Tunnel
   , MonadWsTunnel(..)
   , ReceivedMessage(..)
   , printTunnel
@@ -244,10 +245,9 @@ waitForAllConnections' = do
   (Tunnel _ connSet _) <- getTunnel
   if Set.null connSet then sendOp EndTunnel >> return () else recvUntil (const True) >> waitForAllConnections
 
-runTunnelT :: (MonadThrow m, MonadIO m) => TunnelT m a -> PendingConnection -> m a
-runTunnelT (TunnelT rm) pc = do
+runTunnelT :: (MonadThrow m, MonadIO m) => TunnelT m a -> Connection -> m a
+runTunnelT (TunnelT rm) conn = do
   -- TODO: bracket and throwM
-  conn <- liftIO $ acceptRequest pc
   t <- liftIO $ newMVar $ Tunnel conn Set.empty Seq.empty
   runReaderT rm t
 

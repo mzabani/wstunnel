@@ -9,6 +9,7 @@ import WsTunnel
 import Data.Text
 import Control.Monad.IO.Class
 import Control.Monad.Catch
+import Control.Concurrent.MVar
 import qualified Data.ByteString as Bs
 import Data.ByteString.Lazy (toStrict, fromStrict)
 import qualified Data.Default.Class as Default
@@ -16,9 +17,8 @@ import qualified Data.X509.CertificateStore as Cert
 import qualified Data.ByteString.Char8 as Bsc
 import System.X509
 
-wstunnelManagerSettings :: (MonadThrow m, MonadIO m) => Cert.CertificateStore -> TunnelT m ManagerSettings
-wstunnelManagerSettings certStore' = do
-  tref <- getTunnelRef
+wstunnelManagerSettings :: (MonadThrow m, MonadIO m) => MVar Tunnel -> m ManagerSettings
+wstunnelManagerSettings tref = do
   certStore <- liftIO $ getSystemCertificateStore
   return $ defaultManagerSettings {
     managerRawConnection = openTlsConn certStore tref,
