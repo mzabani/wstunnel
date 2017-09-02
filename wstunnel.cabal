@@ -15,7 +15,8 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  exposed-modules:     WsTunnel, WsTunnel.HttpClient
+  exposed-modules:     WsTunnel, WsTunnel.Master, WsTunnel.Slave
+  other-modules:       WsTunnel.Internal
   build-depends:       base >= 4.7 && < 5
                      , containers
                      , exceptions
@@ -32,6 +33,18 @@ library
                      , x509-system
                      , monad-control
                      , transformers-base
+                     , connection
+                     , string-conv
+                     , unliftio
+                     , safe-exceptions
+  default-language:    Haskell2010
+
+executable wstunnel-app-exe
+  hs-source-dirs:      app
+  main-is:             Main.hs
+  build-depends:       base >= 4.7 && < 5
+                     , wstunnel
+  ghc-options:         -threaded -rtsopts -with-rtsopts=-N
   default-language:    Haskell2010
 
 test-suite wstunnel-test
