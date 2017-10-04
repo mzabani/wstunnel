@@ -1,11 +1,10 @@
 module Main where
 
 import WsTunnel.Slave
+import Control.Monad.IO.Class
 
 main :: IO ()
-main = connectToMaster "127.0.0.1" 8080 "/extrato" $ do
-    let creds = Credenciais { }
-    sendUnchanneledData $ encode 
-    processConnectionRequest -- Login
-    processConnectionRequest -- Extrato
-    waitForAllConnections
+main = connectToMaster "127.0.0.1" 8080 "/google" $ do
+    lastMsg <- recvUnchanneledData
+    liftIO $ print lastMsg
+    return ()

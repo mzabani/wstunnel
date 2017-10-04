@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module WsTunnel.Slave (
     connectToMaster
   , MonadWsSlaveTunnel(..)
@@ -19,22 +20,24 @@ import Data.Maybe
 import Data.Monoid
 import Control.Concurrent
 import Control.Exception.Safe
+import Control.Monad.Reader
 -- import Control.Monad.IO.Unlift
 import qualified Data.Set as Set
 import qualified Data.ByteString as Bs
 import qualified Data.ByteString.Lazy as Lbs
+import Control.Concurrent.Async
 
 newtype WsSlaveT m a = WsSlaveT (Wsi.TunnelT m a)
 
 class MonadWsSlaveTunnel m where
-    processConnectionRequest :: m ()
+    -- processConnectionRequest :: m ()
     sendUnchanneledData :: Lbs.ByteString -> m ()
     recvUnchanneledData :: m Lbs.ByteString
     waitForAllConnections :: m ()
     getTunnel :: m Wsi.Tunnel
 
 instance (MonadThrow m, MonadIO m) => MonadWsSlaveTunnel (WsSlaveT m) where
-    processConnectionRequest = processConnectionRequest'
+    -- processConnectionRequest = processConnectionRequest'
     sendUnchanneledData bs = WsSlaveT $ Wsi.sendUnchanneledData bs
     recvUnchanneledData = WsSlaveT $ Wsi.recvUnchanneledData
     waitForAllConnections = WsSlaveT $ Wsi.waitForAllConnections
@@ -53,52 +56,75 @@ instance (MonadIO m, Monad m) => Monad (WsSlaveT m) where
         v <- wst
         let (WsSlaveT x) = f v in x
 
+instance MonadIO m => MonadIO (WsSlaveT m) where
+    liftIO = WsSlaveT . liftIO
+
 connectToMaster :: String -> Int -> String -> WsSlaveT IO a -> IO a
 connectToMaster host port path (WsSlaveT tunnelTAction) = runClient host port path clientApp
-      where clientApp conn = Wsi.runTunnelT tunnelTAction conn
+      where clientApp conn = Wsi.runTunnelT finalAction conn
+            processRec tunnel = bracket_ (return ()) (return ()) (processConnectionRequest' tunnel) >> putStrLn "Received connection request" >> processRec tunnel
+            finalAction = do
+                tunnel <- Wsi.getTunnel
+                liftIO $ print "Connecting to master!"
+                liftIO $ forkIO (processRec tunnel)
+                liftIO $ print "Connected to master!"
+                tunnelTAction
 
 warnConnectionClosed :: Wsi.TunnelConnection -> Wsi.Tunnel -> IO ()
-warnConnectionClosed (Wsi.TunnelConnection code) tunnel@(Wsi.Tunnel conn _ _) = do
+warnConnectionClosed tc@(Wsi.TunnelConnection code) tunnel = do
   Prelude.putStrLn "Sending warnconnectionclosed"
   Wsi.sendOp' (Wsi.SocketClosed code) tunnel
+  Wsi.removeConnection' tc tunnel
 
 -- ^ Waits for the master to open a connection to some host. Returns when it is opened and guarantees
 --   that the tunnel continues until either side decides to close the connection
-processConnectionRequest' :: (MonadIO m, MonadThrow m) => WsSlaveT m ()
-processConnectionRequest' = WsSlaveT $ do
-  tunnel@(Wsi.Tunnel wsconn mvars _) <- Wsi.getTunnel
-  connCtx <- liftIO $ Network.initConnectionContext
-  (addr, port) <- Wsi.recvUntil' isOpenConnection tunnel
-  sock <- liftIO $ Network.connectTo connCtx Network.ConnectionParams {
-      Network.connectionHostname = toS addr,
-      Network.connectionPort = fromIntegral port,
-      Network.connectionUseSecure = Nothing,
-      Network.connectionUseSocks = Nothing
-  }
-  connCode <- liftIO $ modifyMVar mvars (\t@(connSet, msgQueue, lastCode) -> return $ ((connSet, msgQueue, lastCode + 1), lastCode + 1))
-  Wsi.addConnection $ Wsi.TunnelConnection connCode
-  Wsi.sendOp (Wsi.ConnectionOpened connCode)
-  liftIO $ forkIO $ readFromSocketAndSendToTunnel sock (Wsi.TunnelConnection connCode) tunnel
-  liftIO $ forkIO $ readFromTunnelAndSendToSocket sock (Wsi.TunnelConnection connCode) tunnel
+processConnectionRequest' :: Wsi.Tunnel -> IO ()
+processConnectionRequest' tunnel@(Wsi.Tunnel wsconn mvars _ _) = do
+  connCtx <- Network.initConnectionContext
+  -- print "Waiting for OpenConnection request"
+  (addr, port) <- Wsi.recvUntil' isOpenConnection tunnel "{{ISOPENCONNECTION}}"
+  print $ "Connecting to " ++ toS addr ++ " at port " ++ show port
+  let connParams = Network.ConnectionParams {
+        Network.connectionHostname = toS addr,
+        Network.connectionPort = fromIntegral port,
+        Network.connectionUseSecure = Nothing,
+        Network.connectionUseSocks = Nothing
+    }
+  forkIO $ bracket (Network.connectTo connCtx connParams) (Network.connectionClose) $ \sock -> do
+    print "Connected!"
+    connCode <- modifyMVar mvars (\t@(connSet, msgQueue, lastCode) -> return $ ((connSet, msgQueue, lastCode + 1), lastCode + 1))
+    let tunConn = Wsi.TunnelConnection connCode
+    Wsi.addConnection' tunConn tunnel
+    Wsi.sendOp' (Wsi.ConnectionOpened connCode) tunnel
+    withAsync (readFromSocketAndSendToTunnel sock tunConn tunnel) $ \as1 -> do
+        withAsync (readFromTunnelAndSendToSocket sock tunConn tunnel) $ \as2 -> do
+            let recvSocketClosed op = case op of
+                                        Wsi.SocketClosed connCode -> Just (Nothing, ())
+                                        _                         -> Nothing
+              in Wsi.recvUntil' recvSocketClosed tunnel "{{SOCKET CLOSED FROM OTHER SIDE}}"
+            print "Received SocketClosed from master"
+            warnConnectionClosed tunConn tunnel
+            cancel as1
+            cancel as2
+            print "All done"
+    return ()
   return ()
-  where isOpenConnection op = case op of
-                                Wsi.OpenConnection addr port -> Just (Nothing, (addr, port))
-                                _                            -> Nothing
+    where isOpenConnection op = case op of
+                                    Wsi.OpenConnection addr port -> Just (Nothing, (addr, port))
+                                    _                            -> Nothing
 
 readFromSocketAndSendToTunnel :: Network.Connection -> Wsi.TunnelConnection -> Wsi.Tunnel -> IO ()
 readFromSocketAndSendToTunnel sock tc tref = do
---    print "Waiting for data from socket"
-    bs <- liftIO $ Network.connectionGetChunk sock
---    print "Data received: "
+    -- print "Waiting for data from socket"
+    bs <- Network.connectionGetChunk sock
+    --    print "Data received: "
     if Bs.null bs
-      then warnConnectionClosed tc tref
-      else Wsi.sendData' (toS bs) tc tref >> readFromSocketAndSendToTunnel sock tc tref
+    then print "EMPTY BYTESTRING CHUNK!" >> warnConnectionClosed tc tref
+    else Wsi.sendData' (toS bs) tc tref >> readFromSocketAndSendToTunnel sock tc tref
 
 readFromTunnelAndSendToSocket :: Network.Connection -> Wsi.TunnelConnection -> Wsi.Tunnel -> IO ()
 readFromTunnelAndSendToSocket sock tc tref = do
---    print "Waiting for data from master"
     bs <- Wsi.recvDataFrom' tc tref
---    print "Data received: "
     case bs of
-      Wsi.BytesOnly _ bs           -> liftIO (print bs) >> Network.connectionPut sock (toS bs) >> readFromTunnelAndSendToSocket sock tc tref
+      Wsi.BytesOnly _ bs           -> Network.connectionPut sock (toS bs) >> readFromTunnelAndSendToSocket sock tc tref
       Wsi.TunnelConnectionClosed _ -> print "Closing socket (Requested by master)" >> Network.connectionClose sock >> warnConnectionClosed tc tref

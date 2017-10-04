@@ -37,6 +37,7 @@ library
                      , string-conv
                      , unliftio
                      , safe-exceptions
+                     , async
   default-language:    Haskell2010
 
 executable wstunnel-app-exe

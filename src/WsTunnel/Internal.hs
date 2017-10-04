@@ -1,4 +1,5 @@
 {-# LANGUAGE TypeSynonymInstances #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -6,6 +7,7 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -18,17 +20,22 @@ import Network.WebSockets
 import Data.Foldable (toList)
 import Data.ByteString.Lazy hiding (empty, null, take, repeat, find)
 import Data.Word
+import Control.Exception.Safe hiding (throwM, MonadThrow)
+import Control.Monad.Catch (throwM, MonadThrow)
 import Control.Monad.IO.Class
-import Control.Monad.Catch
 import Control.Monad.Reader
 import Control.Monad.State
 import Control.Monad.Trans
 import Control.Monad.Base
 import Control.Monad.Trans.Control
+import Control.Concurrent
 import Control.Concurrent.MVar
+import Control.Concurrent.Async
+import Data.String.Conv
+import System.IO.Unsafe (unsafePerformIO)
 import Data.Monoid ((<>))
 import Control.Applicative ((<|>))
-import Data.Attoparsec.ByteString hiding (repeat, find)
+import Data.Attoparsec.ByteString hiding (repeat, find, try)
 import Prelude hiding (length, take, drop, putStr, null, map, splitAt)
 import qualified Data.Text as T
 import qualified Data.ByteString.Builder as BsBuild
@@ -36,7 +43,7 @@ import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 
 -- SENDING AND RECEIVING DATA DIRECTLY TO AND FROM CONNECTIONS (PARSING AND ENCODING OUR TYPES)
-newtype TunnelConnection = TunnelConnection Word8 deriving (Eq)
+newtype TunnelConnection = TunnelConnection Word8 deriving (Eq, Show)
 data ConnectionRequest = ConnectionRequest { address :: T.Text, port :: Int } deriving (Generic, ToJSON, FromJSON)
 
 data Operation = OpenConnection T.Text Int | Message Word8 ByteString | SocketClosed Word8 | ConnectionOpened Word8 | UnchanneledMessage ByteString | EndTunnel  deriving (Show)
@@ -53,11 +60,11 @@ toBinaryRepresentation EndTunnel = BsBuild.toLazyByteString $ BsBuild.word8 4 <>
 toBinaryRepresentation (UnchanneledMessage bs) = BsBuild.toLazyByteString (BsBuild.word8 5 <> BsBuild.int64BE 0 <> BsBuild.word8 0) <> bs
 
 sendOp' :: (MonadThrow m, MonadIO m) => Operation -> Tunnel -> m ()
-sendOp' op (Tunnel conn mvars _) = do
-  -- TODO: bracket and throwM
-  liftIO $ sendDataMessage conn $ Binary (toBinaryRepresentation op)
+sendOp' op (Tunnel conn mvars _ sendSemaphore) = do
+  liftIO $ bracket_ (takeMVar sendSemaphore) (putMVar sendSemaphore ()) (sendDataMessage conn $ Binary (toBinaryRepresentation op))
   case op of
     SocketClosed code -> liftIO $ modifyMVar_ mvars (\(cset, msgqueue, lastCode) -> return $ (Set.delete code cset, msgqueue, lastCode))
+    OpenConnection _ _ -> liftIO $ print "Sending openconnection"
     _                 -> return ()
 
 openConnectionParser :: Parser Operation
@@ -133,14 +140,18 @@ addConnection :: (MonadThrow m, MonadIO m) => TunnelConnection -> TunnelT m ()
 addConnection tc = getTunnel >>= addConnection' tc
 
 addConnection' :: (MonadThrow m, MonadIO m) => TunnelConnection -> Tunnel -> m ()
-addConnection' (TunnelConnection code) (Tunnel _ mvars _) =
+addConnection' (TunnelConnection code) (Tunnel _ mvars _ _) =
   liftIO $ modifyMVar_ mvars $ \(connSet, msgQueue, lastCode) -> return $ (Set.insert code connSet, msgQueue, max code lastCode)
+
+removeConnection' :: (MonadThrow m, MonadIO m) => TunnelConnection -> Tunnel -> m ()
+removeConnection' (TunnelConnection code) (Tunnel _ mvars _ _) =
+  liftIO $ modifyMVar_ mvars $ \(connSet, msgQueue, lastCode) -> return $ (Set.delete code connSet, msgQueue, max code lastCode)
 
 addOpToQueue :: (MonadThrow m, MonadIO m) => Operation -> TunnelT m ()
 addOpToQueue op = getTunnel >>= addOpToQueue' op
 
 addOpToQueue' :: (MonadThrow m, MonadIO m) => Operation -> Tunnel -> m ()
-addOpToQueue' op (Tunnel _ mvars _) = liftIO $ modifyMVar_ mvars (\(connSet, msgqueue, lastCode) -> return $ (connSet, msgqueue Seq.|> op, lastCode))
+addOpToQueue' op (Tunnel _ mvars _ _) = liftIO $ modifyMVar_ mvars (\(connSet, msgqueue, lastCode) -> return $ (connSet, msgqueue Seq.|> op, lastCode))
 
 instance (MonadIO m, MonadBase b m) => MonadBase b (TunnelT m) where
   liftBase = liftBaseDefault
@@ -167,8 +178,8 @@ instance MonadIO m => MonadIO (TunnelT m) where
 instance (MonadIO m, MonadThrow m) => MonadThrow (TunnelT m) where
   throwM = TunnelT . throwM
 
--- ^ The last MVar is a binary semaphore. Threads takeMVar before receiving, modify the Tunnel putMVar after that.
-data Tunnel = Tunnel !Connection !(MVar (Set.Set Word8, Seq.Seq Operation, Word8)) !(MVar ())
+-- ^ The last two MVars are binary semaphores. Threads takeMVar before receiving, modify the Tunnel putMVar after that.
+data Tunnel = Tunnel !Connection !(MVar (Set.Set Word8, Seq.Seq Operation, Word8)) !(MVar ()) !(MVar ())
 
 -- ^ Remove this in future versions of "container"
 deleteAt :: Int -> Seq.Seq a -> Seq.Seq a
@@ -180,7 +191,7 @@ sendOp op = getTunnel >>= sendOp' op
 -- ^ Waits for all open connections to end
 waitForAllConnections :: (MonadThrow m, MonadIO m) => TunnelT m ()
 waitForAllConnections = do
-  Tunnel conn mvars recvSemaphore <- getTunnel
+  Tunnel conn mvars recvSemaphore _ <- getTunnel
   isEmpty <- liftIO $ withMVar mvars (\(connSet, _, _) -> return $ Set.null connSet)
   case isEmpty of
     True  -> return ()
@@ -194,48 +205,44 @@ waitForAllConnections = do
 
 runTunnelT :: (MonadThrow m, MonadIO m) => TunnelT m a -> Connection -> m a
 runTunnelT (TunnelT rm) conn = do
-  -- TODO: bracket and throwM
   mvars <- liftIO $ newMVar $ (Set.empty, Seq.empty, 0)
   recvSemaphore <- liftIO $ newMVar ()
-  let tun = Tunnel conn mvars recvSemaphore
+  sendSemaphore <- liftIO $ newMVar ()
+  let tun = Tunnel conn mvars recvSemaphore sendSemaphore
+  liftIO $ forkIO $ receiveMessages recvSemaphore mvars
   runReaderT rm tun
+  where receiveMessages recvSemaphore mvars = do
+          excOrTunmod <- try $ recvOp' conn
+          case excOrTunmod of
+            Left (e :: SomeException) -> return ()
+            Right op -> do
+              modifyMVar_ mvars (\(connSet, msgQueue, lastCode) -> return $ (connSet, msgQueue Seq.|> op, lastCode))
+              receiveMessages recvSemaphore mvars
 
 escapeTunnel :: (MonadThrow m, MonadIO m) => Tunnel -> TunnelT m a -> m a
 escapeTunnel iot t = runReaderT rm iot
   where (TunnelT rm) = t
 
 -- ^ Looks for the first received operation in the msgQueue that satisfies the predicate. If one isn't found, receives messages (while putting them in the queue) until it is found, removes it from the msgQueue and returns it
-recvUntil :: (MonadThrow m, MonadIO m) => (Operation -> Maybe (Maybe Operation, a)) -> TunnelT m a
-recvUntil f = getTunnel >>= recvUntil' f
-
--- PROBLEM FOUND: When two threads call recvUntil', it may happen that both wait for a new operation.
--- If the operation one of them (call it thread 1) is waiting for arrives to thread 2, thread 1
--- will remaing waiting for another operation, when in fact it should recursively call recvUntil' at
--- that point, because now the operation is at the queue!
+recvUntil :: (MonadThrow m, MonadIO m) => (Operation -> Maybe (Maybe Operation, a)) -> T.Text -> TunnelT m a
+recvUntil f desc = getTunnel >>= \t -> recvUntil' f t desc
 
 -- Applies "f" to every received operation (in order of arrival) until it returns a tuple. Replaces
 -- the Operation with the Operation in the tuple inside the message queue if an Operation is present,
 -- finally returning the value from this function
-recvUntil' :: (MonadThrow m, MonadIO m) => (Operation -> Maybe (Maybe Operation, a)) -> Tunnel -> m a
-recvUntil' f tunnel@(Tunnel conn mvars recvSemaphore) = do
+recvUntil' :: (MonadThrow m, MonadIO m) => (Operation -> Maybe (Maybe Operation, a)) -> Tunnel -> T.Text -> m a
+recvUntil' f tunnel@(Tunnel conn mvars recvSemaphore _) desc = do
   valueMaybe <- liftIO $ modifyMVar mvars getOpFromTunnel
   case valueMaybe of
-    Just value -> return value
+    Just value -> do
+      -- liftIO $ print $ T.concat ["Found op ", desc, " at queue"]
+      -- liftIO $ modifyMVar_ recvSemaphore (const $ return ())
+      return value
     Nothing    -> do
-      liftIO $ print "Couldn't find operation. Waiting for next operation"
-      liftIO $ takeMVar recvSemaphore
-      -- Some other thread may have received the operation we need after takeMVar (after wakeup). We check that first
-      -- TODO: bracket
-      valueMaybe2 <- liftIO $ modifyMVar mvars getOpFromTunnel
-      case valueMaybe2 of
-        Just value -> liftIO (putMVar recvSemaphore ()) >> return value
-        Nothing    -> do
-          (op, tunMod) <- recvOp' conn
-          liftIO $ print $ "Received: " ++ show op
-          liftIO $ modifyMVar_ mvars $ (return . tunMod)
-          liftIO $ putMVar recvSemaphore ()
-          liftIO $ print "Tunnel modified. Looking for desired operation recursively"
-          recvUntil' f tunnel
+      -- liftIO $ print $ T.concat ["Couldn't find operation ", desc, ". Waiting for mvars to be modified and try again"]
+      -- liftIO $ modifyMVar_ recvSemaphore (const $ return ())
+      -- liftIO $ print $ T.concat ["Looking recursively for ", desc, " after modification to mvars"]
+      recvUntil' f tunnel desc
   where findWithIdx :: (a -> Maybe b) -> Int -> [a] -> Maybe (a, b, Int)
         findWithIdx g i (x:xs) = case g x of
                                    Nothing -> findWithIdx g (i + 1) xs
@@ -244,14 +251,14 @@ recvUntil' f tunnel@(Tunnel conn mvars recvSemaphore) = do
         getOpFromTunnel (connSet, msgQueue, lastCode) = do
           case findWithIdx f 0 (toList msgQueue) of
             Just (msg, (replacement, v), idx) -> do
-              newQueue <- case replacement of
-                            Nothing -> print ("Found operation " ++ show msg ++ ". Removing it from queue") >> (return $ deleteAt idx msgQueue)
-                            Just rp -> print ("Found operation " ++ show msg ++ ". Replacing it with another") >> (return $ Seq.update idx rp msgQueue)
+              let newQueue = case replacement of
+                               Nothing -> deleteAt idx msgQueue
+                               Just rp -> Seq.update idx rp msgQueue
               return ((connSet, newQueue, lastCode), Just v)
             Nothing -> return ((connSet, msgQueue, lastCode), Nothing)
 
--- ^ Receives data from some tunnel connection (you can't pick which) and returns it, while updating the connection set and the message queue
-recvOp' :: (MonadThrow m, MonadIO m) => Connection -> m (Operation, ((Set.Set Word8, Seq.Seq Operation, Word8) -> (Set.Set Word8, Seq.Seq Operation, Word8)))
+-- ^ Receives data from some tunnel connection (you can't pick which) and returns it
+recvOp' :: (MonadThrow m, MonadIO m) => Connection -> m Operation
 recvOp' conn = do
   dataMsg <- liftIO $ receiveDataMessage conn
   case dataMsg of
@@ -259,16 +266,15 @@ recvOp' conn = do
     Binary msg -> do
       case parseOnly ((messageParser <|> connectionOpenedParser <|> socketClosedParser <|> unchanneledMessageParser <|> openConnectionParser <|> endTunnelParser) <* endOfInput) (toStrict msg) of
         Left _   -> liftIO (Prelude.putStrLn "ERRO PARSING!") >> throwM ErrorWhenReceivingData
-        Right op -> let tunMod (connSet, msgQueue, lastCode) = case op of
-                                                       SocketClosed code -> (Set.delete code connSet, msgQueue Seq.|> op, lastCode)
-                                                       ConnectionOpened code -> (Set.insert code connSet, msgQueue Seq.|> op, code)
-                                                       op' -> (connSet, msgQueue Seq.|> op', lastCode)
-                    in return (op, tunMod)
+        Right op -> return op
 
 openConnection :: (MonadThrow m, MonadIO m) => T.Text -> Int -> TunnelT m TunnelConnection
 openConnection addr port = do
   sendOp (OpenConnection addr port)
-  recvUntil isConnOpened
+  tc <- recvUntil isConnOpened "{{ISCONNOPENED}}"
+  addConnection tc
+  liftIO $ print $ "Received ConnectionOpened " ++ show tc
+  return tc
   where isConnOpened op = case op of
                             ConnectionOpened code -> Just (Nothing, TunnelConnection code)
                             _                     -> Nothing
@@ -279,7 +285,7 @@ recvDataFrom :: (MonadThrow m, MonadIO m) => TunnelConnection -> TunnelT m Recei
 recvDataFrom tc = getTunnel >>= recvDataFrom' tc
 
 recvDataFrom' :: (MonadThrow m, MonadIO m) => TunnelConnection -> Tunnel -> m ReceivedMessage
-recvDataFrom' tc@(TunnelConnection connCode) tref = liftIO (print $ "Waiting for Message or SocketClosed from tunnel " ++ show connCode) >> recvUntil' isDesired tref
+recvDataFrom' tc@(TunnelConnection connCode) tref = recvUntil' isDesired tref $ T.concat ["{{DATAORSOCKETCLOSED ", toS (show connCode), "}}"]
   where isDesired (Message tc' bs)    = if tc' == connCode then Just (Nothing, BytesOnly tc bs) else Nothing
         isDesired (SocketClosed tc')  = if tc' == connCode then Just (Nothing, TunnelConnectionClosed tc) else Nothing
         isDesired _                   = Nothing
@@ -288,7 +294,7 @@ recvAtMostFrom :: (MonadThrow m, MonadIO m) => Int -> TunnelConnection -> Tunnel
 recvAtMostFrom size tc = getTunnel >>= recvAtMostFrom' size tc
 
 recvAtMostFrom' :: (MonadThrow m, MonadIO m) => Int -> TunnelConnection -> Tunnel -> m ByteString
-recvAtMostFrom' size tc@(TunnelConnection connCode) tref = recvUntil' isDesired tref
+recvAtMostFrom' size tc@(TunnelConnection connCode) tref = recvUntil' isDesired tref "{{RECEIVEATMOST}}"
   where isDesired (Message tc' bs) = if tc' /= connCode 
                                        then Nothing
                                        else
@@ -299,7 +305,7 @@ recvAtMostFrom' size tc@(TunnelConnection connCode) tref = recvUntil' isDesired 
         isDesired _                = Nothing
 
 recvUnchanneledData :: (MonadThrow m, MonadIO m) => TunnelT m ByteString
-recvUnchanneledData = recvUntil isUnchanneledMsg
+recvUnchanneledData = recvUntil isUnchanneledMsg "{{ISUNCHANNELEDDATA}}"
   where isUnchanneledMsg op = case op of
                                 UnchanneledMessage bs -> Just (Nothing, bs)
                                 _                     -> Nothing
@@ -318,14 +324,18 @@ sendData bs tc = getTunnel >>= sendData' bs tc
 sendData' :: (MonadThrow m, MonadIO m) => ByteString -> TunnelConnection -> Tunnel -> m ()
 sendData' msg (TunnelConnection code) tref = do
   --liftIO $ Prelude.putStrLn $ "Sending message to connection of code " ++ show code ++ ": " ++ show msg
-  sendOp' (Message code msg) tref
+  liftIO $ sendOp' (Message code msg) tref
 
 closeConnection :: (MonadThrow m, MonadIO m) => TunnelConnection -> TunnelT m ()
-closeConnection (TunnelConnection code) = sendOp (SocketClosed code)
+closeConnection (TunnelConnection code) = do
+  sendOp (SocketClosed code)
+  Tunnel _ mvars _ _ <- getTunnel
+  liftIO $ modifyMVar_ mvars (\(connSet, msgQueue, lastCode) -> return (Set.delete code connSet, msgQueue, lastCode))
+  return ()
 
 isTunnelOpen :: (MonadThrow m, MonadIO m) => TunnelConnection -> TunnelT m Bool
 isTunnelOpen (TunnelConnection tc) = do
-  Tunnel _ mvars _ <- getTunnel
+  Tunnel _ mvars _ _ <- getTunnel
   liftIO $ withMVar mvars (\(connSet, _, _) -> return $ Set.member tc connSet)
 
 getTunnel :: MonadIO m => TunnelT m Tunnel

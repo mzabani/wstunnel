@@ -112,9 +112,9 @@ wstunnelManagerSettings' = do
     managerTlsConnection = openTlsConn certStore tref
   }
     where openRawConn tref = return $ \_ addr port -> escapeMasterTunnel tref $ do
-            liftIO $ Prelude.putStrLn $ "OPENING CONNECTION TO " ++ addr
-            wsconn <- openConnection (toS addr) port
-            liftIO $ Prelude.putStrLn "CONNECTION OPENED"
+            -- liftIO $ Prelude.putStrLn $ "OPENING CONNECTION TO " ++ addr
+            wsconn <- openConnection (Data.Text.pack addr) port
+            -- liftIO $ Prelude.putStrLn "CONNECTION OPENED"
             conn <- liftIO $ makeConnection (rawRecvData wsconn) (rawSendData wsconn) (rawCloseConnection wsconn)
             return conn
             where
@@ -126,15 +126,12 @@ wstunnelManagerSettings' = do
               rawSendData tc bs = escapeMasterTunnel tref $ sendData (toS bs) tc
               rawCloseConnection tc = escapeMasterTunnel tref $ closeConnection tc
           openTlsConn cs tref = return $ \_ addr port -> escapeMasterTunnel tref $ do
-            liftIO $ Prelude.putStrLn $ "OPENING CONNECTION TO " ++ addr
+            -- liftIO $ Prelude.putStrLn $ "OPENING CONNECTION TO " ++ addr
             wsconn <- openConnection (toS addr) port
-            liftIO $ Prelude.putStrLn "CONNECTION OPENED"
+            -- liftIO $ Prelude.putStrLn "CONNECTION OPENED"
             tlsContext <- TLS.contextNew (tlsBackend wsconn) (clientParams cs addr (toS (show port)))
             TLS.handshake tlsContext
-            liftIO $ Prelude.putStrLn "HANDSHAKE DONE!"
-            -- TODO: exception for closed connection!
-            -- The line below is only for non-TLS connections!
-            --conn <- liftIO $ makeConnection (connRead tref wsconn) (connWrite tref wsconn) (connClose tref wsconn)
+            -- liftIO $ Prelude.putStrLn "HANDSHAKE DONE!"
             conn <- liftIO $ makeConnection (TLS.recvData tlsContext) (TLS.sendData tlsContext . toS) (TLS.bye tlsContext)
             return conn
               where
@@ -177,28 +174,17 @@ wstunnelManagerSettings' = do
                         recvExactlyN 0 = return Bs.empty
                         recvExactlyN numBytes = escapeMasterTunnel tref $ do
                           --liftIO $ Prelude.putStrLn $ "Want to receive " ++ show numBytes ++ " bytes"
+                          -- liftIO $ print $ "Checking if tunnel " ++ show wsconn ++ " is open"
                           open <- isTunnelOpen wsconn
                           case open of
-                            False -> error "Oops! Tunnel isn't open!"
+                            False -> error $ "Oops! Tunnel " ++ show wsconn ++ " isn't open!"
+                            --False -> return Bs.empty
                             True -> do
-                              liftIO $ Prelude.putStrLn $ "Before receive! We need " ++ show numBytes
+                              --liftIO $ Prelude.putStrLn $ "Before receive! We need " ++ show numBytes
                               bytes <- fmap toS $ recvAtMostFrom numBytes wsconn
                               let bytesReceived = Bs.length bytes
-                              liftIO $ Prelude.putStrLn $ "After receive! Received " ++ show bytesReceived
+                              --liftIO $ Prelude.putStrLn $ "After receive! Received " ++ show bytesReceived
                               if bytesReceived < numBytes then do
                                 remaining <- recvExactlyN (numBytes - bytesReceived)
                                 return $ Bs.concat [bytes, remaining]
                               else return bytes
-                -- The lines below are for unprotected connections!
-                -- connRead tref wsconn = escapeTunnel tref $ do
-                --     open <- isTunnelOpen wsconn
-                --     case open of
-                --       False -> error "Oops!"
-                --       True -> do
-                --         msg <- recvDataFrom wsconn
-                --         case msg of
-                --           BytesOnly _ bs -> return $ toStrict bs
-                --           TunnelConnectionClosed _ -> return  Bs.empty
-                -- connWrite tref wsconn = \bs -> escapeTunnel tref $ sendData (fromStrict bs) wsconn
-                -- connClose tref wsconn = escapeTunnel tref $ closeConnection wsconn
-                --, connectionUnread = \bs -> escapeTunnel tref $ unrecvData (BytesOnly wsconn (fromStrict bs))
