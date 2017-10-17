@@ -127,12 +127,12 @@ wstunnelManagerSettings' = do
               rawCloseConnection tc = escapeMasterTunnel tref $ closeConnection tc
           openTlsConn cs tref = return $ \_ addr port -> escapeMasterTunnel tref $ do
             -- liftIO $ Prelude.putStrLn $ "OPENING CONNECTION TO " ++ addr
-            wsconn <- openConnection (toS addr) port
+            tunConn <- openConnection (toS addr) port
             -- liftIO $ Prelude.putStrLn "CONNECTION OPENED"
-            tlsContext <- TLS.contextNew (tlsBackend wsconn) (clientParams cs addr (toS (show port)))
+            tlsContext <- TLS.contextNew (tlsBackend tunConn) (clientParams cs addr (toS (show port)))
             TLS.handshake tlsContext
             -- liftIO $ Prelude.putStrLn "HANDSHAKE DONE!"
-            conn <- liftIO $ makeConnection (TLS.recvData tlsContext) (TLS.sendData tlsContext . toS) (TLS.bye tlsContext)
+            conn <- liftIO $ makeConnection (TLS.recvData tlsContext) (TLS.sendData tlsContext . toS) (print "SHIIIIIT" >> TLS.bye tlsContext >> (escapeMasterTunnel tref $ closeConnection tunConn))
             return conn
               where
                 clientParams cs addr port = (TLS.defaultParamsClient addr port) {
@@ -159,12 +159,12 @@ wstunnelManagerSettings' = do
                 --   },
                 --   TLS.clientDebug = Default.def
                 -- }
-                tlsBackend wsconn = TLS.Backend {
+                tlsBackend tunConn = TLS.Backend {
                   TLS.backendFlush = return (),
-                  TLS.backendClose = escapeMasterTunnel tref $ closeConnection wsconn,
+                  TLS.backendClose = print "SSL BACKEND CLOSE" >> (escapeMasterTunnel tref $ closeConnection tunConn),
                   TLS.backendSend = \bs -> escapeMasterTunnel tref $ do
                     -- liftIO $ Prelude.putStrLn $ "SEND: " ++ toS bs
-                    sendData (toS bs) wsconn,
+                    sendData (toS bs) tunConn,
                   TLS.backendRecv = \n -> do
                     bs <- recvExactlyN n
                     -- liftIO $ Prelude.putStrLn $ "RECEIVED: " ++ show (Bs.length (toS bs))
@@ -175,13 +175,13 @@ wstunnelManagerSettings' = do
                         recvExactlyN numBytes = escapeMasterTunnel tref $ do
                           --liftIO $ Prelude.putStrLn $ "Want to receive " ++ show numBytes ++ " bytes"
                           -- liftIO $ print $ "Checking if tunnel " ++ show wsconn ++ " is open"
-                          open <- isTunnelOpen wsconn
+                          open <- isTunnelOpen tunConn
                           case open of
-                            False -> error $ "Oops! Tunnel " ++ show wsconn ++ " isn't open!"
+                            False -> error $ "Oops! Tunnel " ++ show tunConn ++ " isn't open!"
                             --False -> return Bs.empty
                             True -> do
                               --liftIO $ Prelude.putStrLn $ "Before receive! We need " ++ show numBytes
-                              bytes <- fmap toS $ recvAtMostFrom numBytes wsconn
+                              bytes <- fmap toS $ recvAtMostFrom numBytes tunConn
                               let bytesReceived = Bs.length bytes
                               --liftIO $ Prelude.putStrLn $ "After receive! Received " ++ show bytesReceived
                               if bytesReceived < numBytes then do

@@ -199,6 +199,7 @@ waitForAllConnections = do
       -- If some thread is waiting to receive an operation (which may close a TunnelConnection),
       -- we wait to be signaled for when that happens, then check again!
       -- If no other threads are doing anything, this works just like busy waiting (the semaphore is taken and put repeatedly)
+      -- liftIO (print "NOT EMPTY YET")
       liftIO $ takeMVar recvSemaphore
       liftIO $ putMVar recvSemaphore ()
       waitForAllConnections
@@ -237,6 +238,7 @@ recvUntil' f tunnel@(Tunnel conn mvars recvSemaphore _) desc = do
     Just value -> do
       -- liftIO $ print $ T.concat ["Found op ", desc, " at queue"]
       -- liftIO $ modifyMVar_ recvSemaphore (const $ return ())
+      if desc == "{{SOCKET CLOSED FROM OTHER SIDE}}" then liftIO $ Prelude.putStrLn $ toS desc else return ()
       return value
     Nothing    -> do
       -- liftIO $ print $ T.concat ["Couldn't find operation ", desc, ". Waiting for mvars to be modified and try again"]
@@ -327,9 +329,11 @@ sendData' msg (TunnelConnection code) tref = do
   liftIO $ sendOp' (Message code msg) tref
 
 closeConnection :: (MonadThrow m, MonadIO m) => TunnelConnection -> TunnelT m ()
-closeConnection (TunnelConnection code) = do
-  sendOp (SocketClosed code)
-  Tunnel _ mvars _ _ <- getTunnel
+closeConnection tc = getTunnel >>= closeConnection' tc
+
+closeConnection' :: (MonadThrow m, MonadIO m) => TunnelConnection -> Tunnel -> m ()
+closeConnection' (TunnelConnection code) tunnel@(Tunnel _ mvars _ _) = do
+  sendOp' (SocketClosed code) tunnel
   liftIO $ modifyMVar_ mvars (\(connSet, msgQueue, lastCode) -> return (Set.delete code connSet, msgQueue, lastCode))
   return ()
 

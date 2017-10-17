@@ -94,20 +94,20 @@ processConnectionRequest' tunnel@(Wsi.Tunnel wsconn mvars _ _) = do
     print "Connected!"
     connCode <- modifyMVar mvars (\t@(connSet, msgQueue, lastCode) -> return $ ((connSet, msgQueue, lastCode + 1), lastCode + 1))
     let tunConn = Wsi.TunnelConnection connCode
-    Wsi.addConnection' tunConn tunnel
-    Wsi.sendOp' (Wsi.ConnectionOpened connCode) tunnel
-    withAsync (readFromSocketAndSendToTunnel sock tunConn tunnel) $ \as1 -> do
-        withAsync (readFromTunnelAndSendToSocket sock tunConn tunnel) $ \as2 -> do
-            let recvSocketClosed op = case op of
-                                        Wsi.SocketClosed connCode -> Just (Nothing, ())
-                                        _                         -> Nothing
-              in Wsi.recvUntil' recvSocketClosed tunnel "{{SOCKET CLOSED FROM OTHER SIDE}}"
-            print "Received SocketClosed from master"
-            warnConnectionClosed tunConn tunnel
-            cancel as1
-            cancel as2
-            print "All done"
-    return ()
+    bracket_ (Wsi.addConnection' tunConn tunnel) (Wsi.closeConnection' tunConn tunnel) $ do
+        bracket_ (Wsi.sendOp' (Wsi.ConnectionOpened connCode) tunnel) (warnConnectionClosed tunConn tunnel) $ do
+            withAsync (readFromSocketAndSendToTunnel sock tunConn tunnel) $ \as1 -> do
+                withAsync (readFromTunnelAndSendToSocket sock tunConn tunnel) $ \as2 -> do
+                    let recvSocketClosed op = case op of
+                                                Wsi.SocketClosed connCode -> Just (Nothing, ())
+                                                _                         -> Nothing
+                      in withAsync (Wsi.recvUntil' recvSocketClosed tunnel "{{SOCKET CLOSED FROM OTHER SIDE}}") $ \as3 -> do
+                        -- If any of the threads fail at any point or complete, resources must be released
+                        -- print "WAITING FOR THREADS"
+                        waitAny [as1, as2, as3]
+                        --print "Received SocketClosed from master"
+                        --print "All done"
+        return ()
   return ()
     where isOpenConnection op = case op of
                                     Wsi.OpenConnection addr port -> Just (Nothing, (addr, port))
