@@ -132,7 +132,7 @@ wstunnelManagerSettings' = do
             tlsContext <- TLS.contextNew (tlsBackend tunConn) (clientParams cs addr (toS (show port)))
             TLS.handshake tlsContext
             -- liftIO $ Prelude.putStrLn "HANDSHAKE DONE!"
-            conn <- liftIO $ makeConnection (TLS.recvData tlsContext) (TLS.sendData tlsContext . toS) (print "SHIIIIIT" >> TLS.bye tlsContext >> (escapeMasterTunnel tref $ closeConnection tunConn))
+            conn <- liftIO $ makeConnection (TLS.recvData tlsContext) (TLS.sendData tlsContext . toS) (TLS.bye tlsContext >> (escapeMasterTunnel tref $ closeConnection tunConn))
             return conn
               where
                 clientParams cs addr port = (TLS.defaultParamsClient addr port) {
@@ -161,14 +161,16 @@ wstunnelManagerSettings' = do
                 -- }
                 tlsBackend tunConn = TLS.Backend {
                   TLS.backendFlush = return (),
-                  TLS.backendClose = print "SSL BACKEND CLOSE" >> (escapeMasterTunnel tref $ closeConnection tunConn),
-                  TLS.backendSend = \bs -> escapeMasterTunnel tref $ do
+                  TLS.backendClose = escapeMasterTunnel tref $ closeConnection tunConn,
+                  TLS.backendSend = \bs -> escapeMasterTunnel tref $ sendData (toS bs) tunConn,
+                  {-TLS.backendSend = \bs -> escapeMasterTunnel tref $ do
                     -- liftIO $ Prelude.putStrLn $ "SEND: " ++ toS bs
-                    sendData (toS bs) tunConn,
-                  TLS.backendRecv = \n -> do
+                    sendData (toS bs) tunConn,-}
+                  TLS.backendRecv = recvExactlyN
+                  {-TLS.backendRecv = \n -> do
                     bs <- recvExactlyN n
                     -- liftIO $ Prelude.putStrLn $ "RECEIVED: " ++ show (Bs.length (toS bs))
-                    return bs
+                    return bs-}
                 }
                   where recvExactlyN :: (MonadThrow m, MonadIO m) => Int -> m Bs.ByteString
                         recvExactlyN 0 = return Bs.empty

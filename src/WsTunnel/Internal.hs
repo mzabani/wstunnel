@@ -54,8 +54,8 @@ instance Exception TunnelException
 toBinaryRepresentation :: Operation -> ByteString
 toBinaryRepresentation (OpenConnection addr port) = BsBuild.toLazyByteString (BsBuild.word8 0 <> BsBuild.int64BE 0 <> BsBuild.word8 0) <> encode ConnectionRequest { address = addr, port = port }
 toBinaryRepresentation (Message connId bs) = BsBuild.toLazyByteString (BsBuild.word8 1 <> BsBuild.word8 connId <> BsBuild.int64BE 0) <> bs
-toBinaryRepresentation (SocketClosed i) = BsBuild.toLazyByteString $ BsBuild.word8 2 <> BsBuild.word8 i <> BsBuild.int64BE 0
-toBinaryRepresentation (ConnectionOpened code) = BsBuild.toLazyByteString $ BsBuild.word8 3 <> BsBuild.word8 code <> BsBuild.int64BE 0
+toBinaryRepresentation (SocketClosed connId) = BsBuild.toLazyByteString $ BsBuild.word8 2 <> BsBuild.word8 connId <> BsBuild.int64BE 0
+toBinaryRepresentation (ConnectionOpened connId) = BsBuild.toLazyByteString $ BsBuild.word8 3 <> BsBuild.word8 connId <> BsBuild.int64BE 0
 toBinaryRepresentation EndTunnel = BsBuild.toLazyByteString $ BsBuild.word8 4 <> BsBuild.int64BE 0 <> BsBuild.word8 0
 toBinaryRepresentation (UnchanneledMessage bs) = BsBuild.toLazyByteString (BsBuild.word8 5 <> BsBuild.int64BE 0 <> BsBuild.word8 0) <> bs
 
@@ -213,10 +213,11 @@ runTunnelT (TunnelT rm) conn = do
   liftIO $ forkIO $ receiveMessages recvSemaphore mvars
   runReaderT rm tun
   where receiveMessages recvSemaphore mvars = do
-          excOrTunmod <- try $ recvOp' conn
+          excOrTunmod <- tryAny $ recvOp' conn
           case excOrTunmod of
-            Left (e :: SomeException) -> return ()
+            Left e -> Prelude.putStrLn ("Exception receiving: " ++ show e) >> return ()
             Right op -> do
+              -- Prelude.putStrLn $ "Received op!"
               modifyMVar_ mvars (\(connSet, msgQueue, lastCode) -> return $ (connSet, msgQueue Seq.|> op, lastCode))
               receiveMessages recvSemaphore mvars
 
@@ -238,7 +239,8 @@ recvUntil' f tunnel@(Tunnel conn mvars recvSemaphore _) desc = do
     Just value -> do
       -- liftIO $ print $ T.concat ["Found op ", desc, " at queue"]
       -- liftIO $ modifyMVar_ recvSemaphore (const $ return ())
-      if desc == "{{SOCKET CLOSED FROM OTHER SIDE}}" then liftIO $ Prelude.putStrLn $ toS desc else return ()
+      --if desc == "{{SOCKET CLOSED FROM OTHER SIDE}}" then liftIO $ Prelude.putStrLn $ toS desc else return ()
+      liftIO $ Prelude.putStrLn $ toS desc
       return value
     Nothing    -> do
       -- liftIO $ print $ T.concat ["Couldn't find operation ", desc, ". Waiting for mvars to be modified and try again"]
@@ -264,10 +266,10 @@ recvOp' :: (MonadThrow m, MonadIO m) => Connection -> m Operation
 recvOp' conn = do
   dataMsg <- liftIO $ receiveDataMessage conn
   case dataMsg of
-    Text _     -> liftIO (Prelude.putStrLn "ERRO! MSG TEXTO") >> throwM ErrorWhenReceivingData
+    Text _     -> {-liftIO (Prelude.putStrLn "ERRO! MSG TEXTO") >> -} throw ErrorWhenReceivingData
     Binary msg -> do
       case parseOnly ((messageParser <|> connectionOpenedParser <|> socketClosedParser <|> unchanneledMessageParser <|> openConnectionParser <|> endTunnelParser) <* endOfInput) (toStrict msg) of
-        Left _   -> liftIO (Prelude.putStrLn "ERRO PARSING!") >> throwM ErrorWhenReceivingData
+        Left er  -> liftIO (Prelude.putStrLn $ "ERRO PARSING! ///// Length: " ++ show (length msg) ++ show er) >> throw ErrorWhenReceivingData
         Right op -> return op
 
 openConnection :: (MonadThrow m, MonadIO m) => T.Text -> Int -> TunnelT m TunnelConnection
@@ -275,7 +277,7 @@ openConnection addr port = do
   sendOp (OpenConnection addr port)
   tc <- recvUntil isConnOpened "{{ISCONNOPENED}}"
   addConnection tc
-  liftIO $ print $ "Received ConnectionOpened " ++ show tc
+  -- liftIO $ print $ "Received ConnectionOpened " ++ show tc
   return tc
   where isConnOpened op = case op of
                             ConnectionOpened code -> Just (Nothing, TunnelConnection code)
