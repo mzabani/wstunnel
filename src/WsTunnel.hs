@@ -5,9 +5,8 @@ module WsTunnel  (
   , TunnelConnection
   , TunnelException
   , WsMasterTunnelT
+  , WsSlaveT
   , Tunnel
---  , MonadWsMasterTunnel(..)
---  , MonadWsSlaveTunnel(..)
   , ReceivedMessage(..)
   ) where
 

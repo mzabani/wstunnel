@@ -32,19 +32,30 @@ import qualified WsTunnel.Internal as Wsi
 newtype WsMasterTunnelT m a = WsMasterTunnelT (Wsi.TunnelT m a)
 
 class MonadWsMasterTunnel m where
+    -- | Makes the Slave open a TCP connection to some host on some port.
     openConnection :: Text -> Int -> m Wsi.TunnelConnection
+    -- | Closes an open TCP connection
     closeConnection :: Wsi.TunnelConnection -> m ()
     isTunnelOpen :: Wsi.TunnelConnection -> m Bool
+    -- | Sends data through an open connection. This always goes through the Slave, so be 
+    -- aware that if you're not using End-to-End encryption the Slave _will_ have access to all
+    -- content that goes through this connection.
     sendData :: ByteString -> Wsi.TunnelConnection -> m ()
+    -- | Receives data from an open TCP connection.
     recvDataFrom :: Wsi.TunnelConnection -> m Wsi.ReceivedMessage
+    -- | Receive data directly from the Slave. This data is not from any open or closed TCP connections. It is straight
+    -- from the Slave to its Master (us).
     recvUnchanneledData :: m ByteString
+    -- | Send data directly to the Slave. This data is not to any open or closed TCP connections. It is straight
+    -- from us (the Master) to the Slave.
     sendUnchanneledData :: ByteString -> m ()
     recvAtMostFrom :: Int -> Wsi.TunnelConnection -> m ByteString
     wstunnelManagerSettings :: m ManagerSettings
+    -- | Block until all connections opened by us are closed (either by us or by the other parties).
     waitForAllConnections :: m ()
     getTunnel :: m Wsi.Tunnel
 
-instance (MonadIO m, MonadThrow m) => MonadWsMasterTunnel (WsMasterTunnelT m) where
+instance (MonadIO m, MonadThrow m, MonadCatch m) => MonadWsMasterTunnel (WsMasterTunnelT m) where
     openConnection addr port = WsMasterTunnelT $ Wsi.openConnection addr port
     closeConnection tc = WsMasterTunnelT $ Wsi.closeConnection tc
     isTunnelOpen tc = WsMasterTunnelT $ Wsi.isTunnelOpen tc
@@ -54,11 +65,14 @@ instance (MonadIO m, MonadThrow m) => MonadWsMasterTunnel (WsMasterTunnelT m) wh
     sendUnchanneledData bs = WsMasterTunnelT $ Wsi.sendUnchanneledData bs
     recvAtMostFrom size tc = WsMasterTunnelT $ Wsi.recvAtMostFrom size tc
     wstunnelManagerSettings = wstunnelManagerSettings'
-    waitForAllConnections = WsMasterTunnelT $ Wsi.waitForAllConnections
+    waitForAllConnections = WsMasterTunnelT Wsi.waitForAllConnections
     getTunnel = WsMasterTunnelT Wsi.getTunnel
 
-runMasterTunnelT :: (MonadIO m, MonadThrow m) => WsMasterTunnelT m a -> Connection -> m a
-runMasterTunnelT (WsMasterTunnelT action) conn = Wsi.runTunnelT action conn
+-- | Creates a Tunnel over an open Websocket Connection acting as Master (meaning the other side is our Slave).
+-- This means that inside the action passed to this function we may make the Slave open TCP connections for us
+-- and send/receive data to/from the Slave.
+runMasterTunnelT :: (MonadIO m, MonadThrow m, MonadCatch m) => Connection -> WsMasterTunnelT m a -> m a
+runMasterTunnelT conn (WsMasterTunnelT action) = Wsi.runTunnelT action conn
 
 escapeMasterTunnel :: (MonadIO m, MonadThrow m) => Wsi.Tunnel -> WsMasterTunnelT m a -> m a
 escapeMasterTunnel tun (WsMasterTunnelT tunAction) = Wsi.escapeTunnel tun tunAction
@@ -81,6 +95,9 @@ instance MonadIO m => MonadIO (WsMasterTunnelT m) where
 
 instance (MonadIO m, MonadThrow m) => MonadThrow (WsMasterTunnelT m) where
     throwM = WsMasterTunnelT . throwM
+  
+instance (MonadIO m, MonadCatch m) => MonadCatch (WsMasterTunnelT m) where
+    catch (WsMasterTunnelT action) handle = WsMasterTunnelT $ catch action (\e -> let WsMasterTunnelT vt = handle e in vt)
 
 instance (MonadIO m, MonadBase b m) => MonadBase b (WsMasterTunnelT m) where
   liftBase = liftBaseDefault
@@ -103,20 +120,17 @@ instance (MonadIO m, MonadReader r m) => MonadReader r (WsMasterTunnelT m) where
   local modf (WsMasterTunnelT (Wsi.TunnelT rm)) = WsMasterTunnelT . Wsi.TunnelT $ mapReaderT (local modf) rm
 
 -- HTTP Client ManagerSettings
-wstunnelManagerSettings' :: (MonadThrow m, MonadIO m) => WsMasterTunnelT m ManagerSettings
+wstunnelManagerSettings' :: (MonadCatch m, MonadIO m) => WsMasterTunnelT m ManagerSettings
 wstunnelManagerSettings' = do
-  certStore <- liftIO $ getSystemCertificateStore
+  certStore <- liftIO getSystemCertificateStore
   tref <- getTunnel
   return $ defaultManagerSettings {
     managerRawConnection = openRawConn tref,
     managerTlsConnection = openTlsConn certStore tref
   }
     where openRawConn tref = return $ \_ addr port -> escapeMasterTunnel tref $ do
-            -- liftIO $ Prelude.putStrLn $ "OPENING CONNECTION TO " ++ addr
             wsconn <- openConnection (Data.Text.pack addr) port
-            -- liftIO $ Prelude.putStrLn "CONNECTION OPENED"
-            conn <- liftIO $ makeConnection (rawRecvData wsconn) (rawSendData wsconn) (rawCloseConnection wsconn)
-            return conn
+            liftIO $ makeConnection (rawRecvData wsconn) (rawSendData wsconn) (rawCloseConnection wsconn)
             where
               rawRecvData tc = escapeMasterTunnel tref $ do
                                  msg <- recvDataFrom tc
@@ -126,14 +140,10 @@ wstunnelManagerSettings' = do
               rawSendData tc bs = escapeMasterTunnel tref $ sendData (toS bs) tc
               rawCloseConnection tc = escapeMasterTunnel tref $ closeConnection tc
           openTlsConn cs tref = return $ \_ addr port -> escapeMasterTunnel tref $ do
-            -- liftIO $ Prelude.putStrLn $ "OPENING CONNECTION TO " ++ addr
             tunConn <- openConnection (toS addr) port
-            -- liftIO $ Prelude.putStrLn "CONNECTION OPENED"
             tlsContext <- TLS.contextNew (tlsBackend tunConn) (clientParams cs addr (toS (show port)))
             TLS.handshake tlsContext
-            -- liftIO $ Prelude.putStrLn "HANDSHAKE DONE!"
-            conn <- liftIO $ makeConnection (TLS.recvData tlsContext) (TLS.sendData tlsContext . toS) (TLS.bye tlsContext >> (escapeMasterTunnel tref $ closeConnection tunConn))
-            return conn
+            liftIO $ makeConnection (TLS.recvData tlsContext) (TLS.sendData tlsContext . toS) (TLS.bye tlsContext >> escapeMasterTunnel tref (closeConnection tunConn))
               where
                 clientParams cs addr port = (TLS.defaultParamsClient addr port) {
                   TLS.clientSupported = Default.def { TLS.supportedCiphers = ciphersuite_all }
@@ -142,51 +152,21 @@ wstunnelManagerSettings' = do
                   , TLS.sharedValidationCache = Default.def
                   }
                 }
-                -- clientParams addr = TLS.ClientParams {
-                --   TLS.clientUseMaxFragmentLength = Nothing,
-                --   TLS.clientServerIdentification = (addr, undefined),
-                --   TLS.clientUseServerNameIndication = False,
-                --   TLS.clientWantSessionResume = Nothing,
-                --   TLS.clientShared = TLS.Shared {
-                --     TLS.sharedCredentials = TLS.Credentials [],
-                --     TLS.sharedSessionManager = TLS.noSessionManager,
-                --     TLS.sharedCAStore = certStore,
-                --     TLS.sharedValidationCache = Default.def
-                --   },
-                --   TLS.clientHooks = Default.def,
-                --   TLS.clientSupported = Default.def {
-                --     TLS.supportedCiphers = ciphersuite_strong
-                --   },
-                --   TLS.clientDebug = Default.def
-                -- }
                 tlsBackend tunConn = TLS.Backend {
                   TLS.backendFlush = return (),
                   TLS.backendClose = escapeMasterTunnel tref $ closeConnection tunConn,
                   TLS.backendSend = \bs -> escapeMasterTunnel tref $ sendData (toS bs) tunConn,
-                  {-TLS.backendSend = \bs -> escapeMasterTunnel tref $ do
-                    -- liftIO $ Prelude.putStrLn $ "SEND: " ++ toS bs
-                    sendData (toS bs) tunConn,-}
                   TLS.backendRecv = recvExactlyN
-                  {-TLS.backendRecv = \n -> do
-                    bs <- recvExactlyN n
-                    -- liftIO $ Prelude.putStrLn $ "RECEIVED: " ++ show (Bs.length (toS bs))
-                    return bs-}
                 }
-                  where recvExactlyN :: (MonadThrow m, MonadIO m) => Int -> m Bs.ByteString
+                  where recvExactlyN :: (MonadCatch m, MonadIO m) => Int -> m Bs.ByteString
                         recvExactlyN 0 = return Bs.empty
                         recvExactlyN numBytes = escapeMasterTunnel tref $ do
-                          --liftIO $ Prelude.putStrLn $ "Want to receive " ++ show numBytes ++ " bytes"
-                          -- liftIO $ print $ "Checking if tunnel " ++ show wsconn ++ " is open"
                           open <- isTunnelOpen tunConn
-                          case open of
-                            False -> error $ "Oops! Tunnel " ++ show tunConn ++ " isn't open!"
-                            --False -> return Bs.empty
-                            True -> do
-                              --liftIO $ Prelude.putStrLn $ "Before receive! We need " ++ show numBytes
-                              bytes <- fmap toS $ recvAtMostFrom numBytes tunConn
-                              let bytesReceived = Bs.length bytes
-                              --liftIO $ Prelude.putStrLn $ "After receive! Received " ++ show bytesReceived
-                              if bytesReceived < numBytes then do
-                                remaining <- recvExactlyN (numBytes - bytesReceived)
-                                return $ Bs.concat [bytes, remaining]
-                              else return bytes
+                          if open then
+                            do bytes <- toS <$> recvAtMostFrom numBytes tunConn
+                               let bytesReceived = Bs.length bytes
+                               if bytesReceived < numBytes then do
+                                 remaining <- recvExactlyN (numBytes - bytesReceived)
+                                 return $ Bs.concat [bytes, remaining]
+                               else return bytes
+                            else error $ "Oops! Tunnel " ++ show tunConn ++ " isn't open!"
