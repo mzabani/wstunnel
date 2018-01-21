@@ -23,15 +23,12 @@ runMasterAndSlave masterAction slaveAction = do
     masterResultsMVar <- newEmptyMVar
     testWithApplication (return $ runWebServer masterResultsMVar masterAction) $ \port -> do
         --Prelude.putStrLn "0"
-        slaveResultsEither <- tryAny $ connectToMaster "localhost" port "/any-path" slaveAction
-        case slaveResultsEither of
-          Left e -> print e >> error "oops!"
-          Right slaveResults -> do
-            --Prelude.putStrLn "2"
-            masterResults <- takeMVar masterResultsMVar
-            --Prelude.putStrLn "4"
-            --print (masterResults, slaveResults) 
-            return (masterResults, slaveResults)
+        slaveResults <- connectToMaster "localhost" port "/any-path" slaveAction
+        --Prelude.putStrLn "2"
+        masterResults <- takeMVar masterResultsMVar
+        --Prelude.putStrLn "4"
+        --print (masterResults, slaveResults) 
+        return (masterResults, slaveResults)
     
 -- Application is Request -> (Response -> IO ResponseReceived) -> IO ResponseReceived
 runWebServer :: MVar a -> WsMasterTunnelT IO a -> Application

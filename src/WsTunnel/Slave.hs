@@ -104,18 +104,13 @@ connectToMaster host port path (WsSlaveT tunnelTAction) = runClient host port pa
             processRec tunnel = catchAny (processConnectionRequest' tunnel) (const (return ())) >> processRec tunnel
             finalAction = do
                 tunnel <- Wsi.getTunnel
-                liftIO $ forkIO (processRec tunnel)
+                Wsi.forkAndForget (processRec tunnel)
                 tunnelTAction
 
 warnConnectionClosed :: Wsi.TunnelConnection -> Wsi.Tunnel -> IO ()
 warnConnectionClosed tc@(Wsi.TunnelConnection code) tunnel = do
   Wsi.sendOp' (Wsi.SocketClosed code) tunnel
   Wsi.removeConnection' tc tunnel
-
-forkAndForget :: IO a -> IO ()
-forkAndForget action = do
-    forkIO $ catchAny (action >> return ()) (const (return ()))
-    return ()
 
 -- | Waits for the master to open a connection to some host. Returns when it is opened and guarantees
 -- that the tunnel continues until either side decides to close the connection
@@ -129,7 +124,7 @@ processConnectionRequest' tunnel@(Wsi.Tunnel wsconn tvars) = do
         Network.connectionUseSecure = Nothing,
         Network.connectionUseSocks = Nothing
     }
-  forkAndForget $ bracket (Network.connectTo connCtx connParams) Network.connectionClose $ \sock -> do
+  Wsi.forkAndForget $ bracket (Network.connectTo connCtx connParams) Network.connectionClose $ \sock -> do
     connCode <- atomically $ do
         (connSet, msgQueue, lastCode) <- readTVar tvars
         writeTVar tvars (connSet, msgQueue, lastCode + 1)

@@ -200,10 +200,10 @@ runTunnelT :: (MonadThrow m, MonadCatch m, MonadIO m) => TunnelT m a -> Connecti
 runTunnelT (TunnelT rm) conn = do
   tvars <- liftIO $ newTVarIO (Set.empty, Seq.empty, 0)
   let tun = Tunnel conn tvars
-  liftIO $ forkIO $ receiveMessages tvars
+  forkAndForget $ receiveMessages tvars
   results <- runReaderT rm tun
   -- Send a close message and wait for the other close message as well
-  catch (liftIO $ sendClose conn ("" :: ByteString)) ignoreException
+  --catch (liftIO $ sendClose conn ("" :: ByteString)) ignoreException
   return results
   where ignoreException :: Monad m => SomeException -> m ()
         ignoreException _ = return ()
@@ -332,3 +332,8 @@ isTunnelOpen (TunnelConnection tc) = do
 
 getTunnel :: MonadIO m => TunnelT m Tunnel
 getTunnel = TunnelT ask
+
+forkAndForget :: MonadIO m => IO a -> m ()
+forkAndForget action = do
+    liftIO $ forkIO $ catchAny (action >> return ()) (const (return ()))
+    return ()
