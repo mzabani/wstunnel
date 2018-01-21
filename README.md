@@ -6,6 +6,7 @@ The program that connects and allows itself to open connections for the other is
   
 
 What follows are two programs that communicate with each other and show WsTunnel's main (or perhaps even all) features.
+*Important note: I haven't checked if the following code fully type-checks. It should be pretty close, though.*
 
 The Slave
 ---
@@ -88,3 +89,8 @@ Here we'll show you a way to receive websocket connections with Warp alongside y
     -- | Here we put every request to be checked against the paths defined in "websocketsUrls". If none of them
     -- match the request's path it is delegated to your current application
     main = run 80 (websocketsUrl yourCurrentServerApp)
+
+Building this library
+---
+
+We use **stack** (https://docs.haskellstack.org/en/stable/README/) to build this. Just run **stack build** after cloning the repository and it will build. Run **stack test** to run the few unit tests that have been created so far and be warned that one of them fails intermittently for some unknown reason yet.
