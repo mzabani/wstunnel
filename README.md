@@ -3,13 +3,14 @@ WsTunnel
 
 This library allows a program to connect to another program which will then use the first as a proxy for TCP connections. All of this happens over a Websocket connection, hence the library's name, *WsTunnel*.
 The program that connects and allows itself to open connections for the other is from now on called the *Slave*, and the program that was waiting for someone to connect and that has the power to make the *Slave* open connections is the *Master*. *Master* and *Slave* can also exchange data between themselves (not a connection to some other host) and both of them can close the connection at anytime.
-  
 
 What follows are two programs that communicate with each other and show WsTunnel's main (or perhaps even all) features.
 *Important note: I haven't checked if the following code fully type-checks. It should be pretty close, though.*
 
 The Slave
 ---
+
+```haskell
     {-# LANGUAGE OverloadedStrings #-}
     import WsTunnel.Slave
     import Data.ByteString
@@ -20,9 +21,12 @@ The Slave
         sendUnchanneledData "Hi master. Feel free to open connections at any time and send me a message when you're done"
         msgEnding <- recvUnchanneledData
         print msgEnding
+```
 
 The Master
 ---
+
+```haskell
     {-# LANGUAGE OverloadedStrings #-}
     import WsTunnel.Master
     import Data.ByteString
@@ -44,12 +48,14 @@ The Master
       response <- liftIO $ httpLbs req httpMgr
       print response
       Master.sendUnchanneledData "Done!"
+```
 
 Creating a websocket server with Warp
 ---
 
 Here we'll show you a way to receive websocket connections with Warp alongside your current Warp application. This is probably not the best way to do this but it is _one_ way.
 
+```haskell
     {-# LANGUAGE OverloadedStrings #-}
     import Data.Text
     import Network.Wai
@@ -81,7 +87,7 @@ Here we'll show you a way to receive websocket connections with Warp alongside y
             Right wsConn -> do
               catchAny (f wsConn) logException
                 where logException exc = Prelude.putStrLn $ (unpack path) ++ ": Exception: " ++ show exc
-    
+
     -- | This is your current definition of Application
     yourCurrentServerApp :: Application
     yourCurrentServerApp = undefined
@@ -89,8 +95,12 @@ Here we'll show you a way to receive websocket connections with Warp alongside y
     -- | Here we put every request to be checked against the paths defined in "websocketsUrls". If none of them
     -- match the request's path it is delegated to your current application
     main = run 80 (websocketsUrl yourCurrentServerApp)
+```
 
 Building this library
 ---
 
-We use **stack** (https://docs.haskellstack.org/en/stable/README/) to build this. Just run **stack build** after cloning the repository and it will build. Run **stack test** to run the few unit tests that have been created so far and be warned that one of them fails intermittently for some unknown reason yet.
+There are two options to build the project: You can use Nix+Cabal or Stack.
+
+1. You can use **stack** (<https://docs.haskellstack.org/en/stable/README/>). Just run **stack build** after cloning the repository and it will build. Run **stack test** to run the few unit tests that have been created so far and be warned that one of them fails intermittently for some unknown reason yet.
+2. Type **nix-shell** and then **cabal build**. You can run tests with **cabal test**.
